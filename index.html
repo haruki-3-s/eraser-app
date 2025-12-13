@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>AI 消しゴム (デジタル再構築版)</title>
+    <script src="https://docs.opencv.org/4.5.0/opencv.js" async></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #f4f4f9; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 20px; }
+        
+        .status-box { padding: 12px; margin: 15px 0; background: #e8f0fe; border-radius: 4px; color: #0d47a1; font-weight: bold; text-align: left; font-family: monospace; border: 1px solid #b3e5fc; }
+        .error { color: #d32f2f; background: #fdecea; border-color: #ffcdd2; }
+        .success { color: #2e7d32; background: #e8f5e9; border-color: #c8e6c9; }
+        
+        .controls { margin: 20px 0; padding: 20px; border: 2px solid #eee; border-radius: 8px; background: #fafafa; }
+        .slider-container { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
+        input[type="range"] { width: 80%; cursor: pointer; }
+        
+        button { padding: 14px 28px; font-size: 16px; margin: 10px; cursor: pointer; border: none; border-radius: 4px; color: white; transition: 0.2s; font-weight: bold; }
+        .btn-ai { background-color: #007bff; box-shadow: 0 4px 6px rgba(0,123,255,0.2); }
+        .btn-ai:hover { background-color: #0069d9; transform: translateY(-1px); }
+        .btn-ai:active { transform: translateY(1px); }
+        button:disabled { background-color: #ccc; cursor: not-allowed; box-shadow: none; transform: none; }
+
+        .canvas-wrapper { position: relative; display: inline-block; border: 1px solid #ddd; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        canvas { display: block; max-width: 100%; }
+        #canvasOutput { position: absolute; top: 0; left: 0; cursor: crosshair; touch-action: none; opacity: 1.0; }
+        
+        label { display: inline-block; margin-top: 10px; cursor: pointer; user-select: none; }
+        input[type="checkbox"] { transform: scale(1.2); margin-right: 5px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>定期テスト書き込み消去 (Digital Reconstruction)</h1>
+    
+    <div id="status" class="status-box">システム初期化中...</div>
+
+    <div class="controls">
+        <input type="file" id="fileInput" accept="image/*">
+        
+        <div class="slider-container">
+            <label for="thresholdRange"><strong>🖋️ 文字の太さ・判定基準</strong>: <span id="thresholdValue">0.5</span></label><br>
+            <span style="font-size:0.8em; color:#666;">(左: 太く残す / 右: 細くして汚れを消す)</span><br>
+            <input type="range" id="thresholdRange" min="0.1" max="0.9" step="0.05" value="0.5">
+        </div>
+
+        <button id="btnAI" class="btn-ai" onclick="runAIMode()" disabled>🧠 AIで書き直す</button>
+        <br>
+        <label>
+            <input type="checkbox" id="manualMode"> 
+            🖐️ <strong>手動復元モード</strong> (消しゴム/復元ブラシ)
+        </label>
+    </div>
+
+    <div class="canvas-wrapper" id="canvasContainer" style="display:none;">
+        <canvas id="canvasOriginal"></canvas>
+        <canvas id="canvasOutput"></canvas>
+    </div>
+</div>
+
+<script>
+    const statusDiv = document.getElementById('status');
+    const btnAI = document.getElementById('btnAI');
+    const thresholdRange = document.getElementById('thresholdRange');
+    const thresholdValue = document.getElementById('thresholdValue');
+
+    let cvLoaded = false;
+    let ortSession = null;
+
+    // スライダー値更新
+    thresholdRange.addEventListener('input', (e) => {
+        thresholdValue.innerText = e.target.value;
+    });
+
+    function log(msg, type='normal') {
+        statusDiv.innerText = msg;
+        statusDiv.className = 'status-box'; 
+        if(type === 'error') statusDiv.classList.add('error');
+        if(type === 'success') statusDiv.classList.add('success');
+        console.log(msg);
+    }
+
+    if (typeof ort !== 'undefined') {
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+    }
+
+    var Module = {
+        onRuntimeInitialized() {
+            cvLoaded = true;
+            checkReady();
+        }
+    };
+
+    async function loadModel() {
+        const modelPath = './static/eraser_model_packed.onnx';
+        try {
+            log("AIモデル読み込み中...");
+            ortSession = await ort.InferenceSession.create(modelPath);
+            log("✅ 準備完了！画像を選択してください。", 'success');
+            checkReady();
+        } catch (e) {
+            console.error(e);
+            log(`❌ モデルエラー: ${e.message}`, 'error');
+        }
+    }
+    
+    setTimeout(() => {
+        if(typeof ort !== 'undefined') {
+            ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+            loadModel();
+        } else {
+            log("❌ ONNXライブラリ読み込み失敗", 'error');
+        }
+    }, 1000);
+
+    function checkReady() {
+        if (cvLoaded && ortSession && currentImg) btnAI.disabled = false;
+    }
+
+    const fileInput = document.getElementById('fileInput');
+    const canvasOriginal = document.getElementById('canvasOriginal');
+    const canvasOutput = document.getElementById('canvasOutput');
+    const ctxOriginal = canvasOriginal.getContext('2d');
+    const ctxOutput = canvasOutput.getContext('2d');
+    let currentImg = null;
+
+    fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if(!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+                canvasOriginal.width = img.width;
+                canvasOriginal.height = img.height;
+                canvasOutput.width = img.width;
+                canvasOutput.height = img.height;
+                
+                ctxOriginal.drawImage(img, 0, 0);
+                ctxOutput.clearRect(0,0, canvasOutput.width, canvasOutput.height);
+                
+                document.getElementById('canvasContainer').style.display = "inline-block";
+                currentImg = img;
+                checkReady();
+                log("画像セット完了。「AIで書き直す」を押してください。", 'success');
+            };
+            img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+
+    // ★★★ デジタル再構築ロジック ★★★
+    async function runAIMode() {
+        if (!ortSession || !currentImg) return;
+        log("AI処理中... 文字を生成しています...");
+        btnAI.disabled = true;
+        
+        const threshold = parseFloat(thresholdRange.value);
+
+        setTimeout(async () => {
+            try {
+                // 1. 前処理
+                let src = cv.imread(canvasOriginal);
+                let gray = new cv.Mat();
+                cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+                
+                let inputSize = 512;
+                let resized = new cv.Mat();
+                let dsize = new cv.Size(inputSize, inputSize);
+                cv.resize(gray, resized, dsize, 0, 0, cv.INTER_LINEAR);
+                
+                const floatData = new Float32Array(inputSize * inputSize);
+                for (let i = 0; i < inputSize * inputSize; i++) {
+                    floatData[i] = (255.0 - resized.data[i]) / 255.0; 
+                }
+                const inputTensor = new ort.Tensor('float32', floatData, [1, 1, inputSize, inputSize]);
+                
+                // 2. 推論
+                const results = await ortSession.run({ input: inputTensor });
+                const outputData = results.output.data;
+
+                // 3. 後処理
+                let probMat = new cv.Mat(inputSize, inputSize, cv.CV_32FC1);
+                probMat.data32F.set(outputData);
+
+                // ★ここがポイント: 確率マップ自体を「滑らかに」元のサイズへ拡大
+                // 文字の形状データだけをバイリニア補間で引き伸ばします（ベクター化のような効果）
+                let originalSize = new cv.Size(canvasOriginal.width, canvasOriginal.height);
+                let largeProbMat = new cv.Mat();
+                cv.resize(probMat, largeProbMat, originalSize, 0, 0, cv.INTER_LINEAR);
+
+                let finalOutput = new cv.Mat();
+                finalOutput.create(canvasOriginal.height, canvasOriginal.width, cv.CV_8UC1);
+                
+                // ★完全デジタル描画
+                // 元の画素(gray)は一切見ません。AIの自信(prob)だけで黒か白かを決めます。
+                // これにより、元の線や汚れは物理的に消滅します。
+                for (let i = 0; i < largeProbMat.data32F.length; i++) {
+                    let prob = largeProbMat.data32F[i];
+                    
+                    // スライダーの値より確率が高ければ「黒(0)」、そうでなければ「白(255)」
+                    if (prob > threshold) {
+                        finalOutput.data[i] = 0;   // 完全な黒
+                    } else {
+                        finalOutput.data[i] = 255; // 完全な白
+                    }
+                }
+                
+                cv.imshow('canvasOutput', finalOutput);
+                
+                // メモリ解放
+                src.delete(); gray.delete(); resized.delete(); 
+                probMat.delete(); largeProbMat.delete(); finalOutput.delete();
+                
+                log(`✅ 完了！元画像を使わず再構築しました。(太さ設定: ${threshold})`, 'success');
+            } catch (err) {
+                console.error(err);
+                log(`処理エラー: ${err.message}`, 'error');
+            } finally {
+                btnAI.disabled = false;
+            }
+        }, 50);
+    }
+
+    // 手動ブラシ
+    let isDrawing = false;
+    const manualMode = document.getElementById('manualMode');
+    
+    function getPos(e) {
+        const rect = canvasOutput.getBoundingClientRect();
+        let clientX = e.clientX;
+        let clientY = e.clientY;
+        if (e.changedTouches && e.changedTouches.length > 0) {
+            clientX = e.changedTouches[0].clientX;
+            clientY = e.changedTouches[0].clientY;
+        } else if (e.touches && e.touches.length > 0) {
+            clientX = e.touches[0].clientX;
+            clientY = e.touches[0].clientY;
+        }
+        return {
+            x: (clientX - rect.left) * (canvasOutput.width / rect.width),
+            y: (clientY - rect.top) * (canvasOutput.height / rect.height)
+        };
+    }
+
+    function draw(e) {
+        if (!isDrawing) return;
+        e.preventDefault();
+        const pos = getPos(e);
+        ctxOutput.globalCompositeOperation = 'destination-out';
+        ctxOutput.beginPath();
+        let radius = Math.max(10, canvasOutput.width * 0.02);
+        ctxOutput.arc(pos.x, pos.y, radius, 0, Math.PI * 2, false);
+        ctxOutput.fill();
+        ctxOutput.globalCompositeOperation = 'source-over';
+    }
+
+    ['mousedown', 'touchstart'].forEach(evt => 
+        canvasOutput.addEventListener(evt, e => { 
+            if(manualMode.checked) { isDrawing=true; draw(e); } 
+        })
+    );
+    ['mousemove', 'touchmove'].forEach(evt => canvasOutput.addEventListener(evt, draw));
+    ['mouseup', 'mouseout', 'touchend'].forEach(evt => canvasOutput.addEventListener(evt, () => isDrawing=false));
+
+</script>
+</body>
+</html>
